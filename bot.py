@@ -13,10 +13,10 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from langchain_google_genai import ChatGoogleGenerativeAI
 
 # --- НАСТРОЙКИ ---
-load_dotenv('/home/opc/my-english-bot/.env')
+load_dotenv()
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 API_KEY = os.getenv("GOOGLE_API_KEY")
-DB_PATH = '/home/opc/my-english-bot/murphy.db'
+DB_PATH = 'murphy.db'	
 UNITS_PER_PAGE = 10 
 
 logging.basicConfig(level=logging.INFO)
@@ -35,25 +35,40 @@ router = Router()
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 
 def normalize_text(text: str) -> str:
-    """Убирает лишние пробелы, приводит к нижнему регистру и нормализует апострофы."""
+    """Убирает лишние пробелы, нормализует апострофы и раскрывает сокращения для гибкой проверки."""
     if not text:
         return ""
-    # Заменяем все виды апострофов и убираем точки/скобки в конце для гибкости UX
+    
     text = text.strip().lower().replace("’", "'").replace("`", "'")
+    
+    # Словарь сокращений для приведения к единому виду
+    contractions = {
+        "isn't": "is not", "aren't": "are not", "wasn't": "was not",
+        "weren't": "were not", "don't": "do not", "doesn't": "does not",
+        "didn't": "did not", "can't": "cannot", "won't": "will not",
+        "it's": "it is", "he's": "he is", "she's": "she is",
+        "i'm": "i am", "you're": "you are", "we're": "we are", "they're": "they are"
+    }
+    
+    for short, full in contractions.items():
+        text = text.replace(short, full)
+        
     return re.sub(r'[.\)]+$', '', text).strip()
 
 async def get_explanation(theory: str, question: str, correct_answer: str, user_answer: str) -> str:
-    """Запрашивает подсказку у ИИ БЕЗ называния правильного ответа."""
+    """Запрашивает умную подсказку у ИИ, учитывая тип предложения."""
     prompt = f"""
-    Ты — наставник по английскому. Пользователь ошибся.
-    ЗАДАЧА: Дай ОДНУ короткую подсказку-намек на русском, чтобы пользователь сам исправил ошибку.
+    Ты — наставник по английскому. Пользователь ошибся в упражнении.
+    
+    ЗАДАЧА: Дай ОДНУ очень короткую подсказку-намек на русском (до 15 слов).
     
     ПРАВИЛА:
-    1. КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО называть правильный ответ или форму глагола (не пиши "{correct_answer}").
-    2. Если пользователь прав по смыслу, но ошибся в лишнем слове (которое уже есть в вопросе), намекни на это.
-    3. Будь краток (1-2 коротких предложения).
+    1. КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО называть правильный ответ: "{correct_answer}".
+    2. Определи тип предложения (вопрос, отрицание или утверждение) и давай совет только по теме.
+    3. Если пользователь добавил лишнее слово (например, подлежащее, которое уже есть в задании), укажи на это.
+    4. Будь дружелюбным, но лаконичным.
 
-    Правило: {theory}
+    Теория: {theory}
     Задание: {question}
     Ответ пользователя: {user_answer}
     """
@@ -81,17 +96,14 @@ def db_get_unit(unit_id):
     return res
 
 def db_get_exercise(unit_id, excluded_ids=None):
-    """Получает случайное упражнение, исключая уже пройденные."""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    
     if excluded_ids and len(excluded_ids) > 0:
         placeholders = ', '.join('?' for _ in excluded_ids)
         query = f"SELECT id, question, answer FROM exercises WHERE unit_id = ? AND id NOT IN ({placeholders}) ORDER BY RANDOM() LIMIT 1"
         cursor.execute(query, (unit_id, *excluded_ids))
     else:
         cursor.execute("SELECT id, question, answer FROM exercises WHERE unit_id = ? ORDER BY RANDOM() LIMIT 1", (unit_id,))
-    
     res = cursor.fetchone()
     conn.close()
     return res
@@ -106,8 +118,6 @@ def get_units_page(page: int):
     units = cursor.fetchall()
     conn.close()
     return units, total
-
-# --- ГЕНЕРАТОР КЛАВИАТУРЫ МЕНЮ ---
 
 def get_units_kb(page: int):
     units, total_count = get_units_page(page)
@@ -149,10 +159,7 @@ async def change_page(callback: CallbackQuery):
 async def show_unit(callback: CallbackQuery):
     unit_id = int(callback.data.split(":")[1])
     data = db_get_unit(unit_id)
-    if data:
-        text = f"📘 <b>{data[0]}</b>\n\n{data[1]}"
-    else:
-        text = f"📘 <b>Unit {unit_id}</b>\n\n⚠️ Теория не найдена."
+    text = f"📘 <b>{data[0]}</b>\n\n{data[1]}" if data else f"📘 <b>Unit {unit_id}</b>\n\n⚠️ Теория не найдена."
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✍️ Практика (10 заданий)", callback_data=f"practice:{unit_id}")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_list")]
@@ -177,7 +184,7 @@ async def start_practice(callback: CallbackQuery, state: FSMContext):
             question_text=ex[1],
             count=1,
             errors=0,
-            answered_ids=[ex[0]] # Запоминаем ID первого задания
+            answered_ids=[ex[0]]
         )
         await state.set_state(Quiz.waiting_for_answer)
         await callback.message.answer(f"<b>Задание 1/10</b>\n\n📝 {ex[1]}", reply_markup=get_quiz_kb(), parse_mode="HTML")
@@ -198,20 +205,37 @@ async def check_answer(message: Message, state: FSMContext):
     data = await state.get_data()
     if not message.text: return
 
-    user_ans = normalize_text(message.text)
+    user_raw = message.text
+    user_ans = normalize_text(user_raw)
     correct_ans = normalize_text(data.get("correct_answer"))
+    question_text = data.get("question_text")
+    
+    # --- УЛУЧШЕННАЯ ЛОГИКА ПРОВЕРКИ ---
+    is_correct = (user_ans == correct_ans)
+
+    # Если не совпало, проверяем, не продублировал ли юзер подлежащее из вопроса
+    if not is_correct:
+        # Ищем слово перед пропуском (например, "it" в "It ___ raining")
+        match = re.search(r'(\w+)\s+_{3,}', question_text)
+        if match:
+            subject = match.group(1).lower()
+            if user_ans.startswith(subject):
+                # Проверяем остаток строки после подлежащего
+                cleaned_user_ans = user_ans[len(subject):].strip()
+                if cleaned_user_ans == correct_ans:
+                    is_correct = True
+
     unit_id = data.get("unit_id")
     current_count = data.get("count")
     total_errors = data.get("errors")
     answered_ids = data.get("answered_ids", [])
 
-    # Лояльная проверка: если в базе "She's having", а юзер ввел "having", или наоборот
-    if user_ans == correct_ans or (len(user_ans) > 3 and user_ans in correct_ans):
+    if is_correct:
         if current_count < 10:
             ex = db_get_exercise(unit_id, excluded_ids=answered_ids)
-            if not ex: # Если вдруг кончились задания
+            if not ex:
                 await state.clear()
-                await message.answer("🎉 Больше заданий нет! Вы прошли всё доступное.")
+                await message.answer("🎉 Больше заданий нет!")
                 return
                 
             answered_ids.append(ex[0])
@@ -236,7 +260,7 @@ async def check_answer(message: Message, state: FSMContext):
         theory_text = unit_data[1] if unit_data else ""
         
         wait_msg = await message.answer("🤔 Анализирую...")
-        explanation = await get_explanation(theory_text, data.get("question_text"), data.get("correct_answer"), message.text)
+        explanation = await get_explanation(theory_text, question_text, data.get("correct_answer"), user_raw)
         await wait_msg.edit_text(f"❌ <b>Не совсем так</b>\n\n{explanation}", reply_markup=get_quiz_kb(), parse_mode="HTML")
 
 async def main():
